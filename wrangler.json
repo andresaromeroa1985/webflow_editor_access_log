@@ -10,5 +10,13 @@
   },
   "observability": {
     "enabled": true
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "editor_access_log",
+      "database_id": "PLACEHOLDER_WEBFLOW_CLOUD_ASSIGNS_THIS",
+      "migrations_dir": "migrations"
+    }
+  ]
 }
