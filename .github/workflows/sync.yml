@@ -1,0 +1,71 @@
+name: Nightly Webflow activity sync
+
+# Webflow Cloud has no built-in cron, so the schedule lives here and calls the
+# app's /api/sync endpoint. The endpoint processes a batch of sites per request
+# and returns the next offset; this job loops until it reports done.
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # 09:00 UTC ≈ 02:00 PT
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: "Sites per request"
+        default: "25"
+        required: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Page through all sites
+        env:
+          APP_URL: ${{ secrets.APP_URL }} # e.g. https://sites.spoton.com/editor-log
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          BATCH: ${{ github.event.inputs.batch || '25' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APP_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
+            echo "::error::APP_URL and CRON_SECRET repository secrets must be set."
+            exit 1
+          fi
+
+          offset=0
+          total_events=0
+          total_errors=0
+
+          for i in $(seq 1 200); do
+            echo "→ batch at offset=$offset"
+
+            response=$(curl -sS --fail-with-body \
+              --max-time 300 \
+              -H "Authorization: Bearer ${CRON_SECRET}" \
+              "${APP_URL}/api/sync?offset=${offset}&batch=${BATCH}")
+
+            echo "$response" | jq -c '{done, nextOffset, sitesProcessed, eventsInserted, errors}'
+
+            inserted=$(echo "$response" | jq -r '.eventsInserted // 0')
+            errs=$(echo "$response" | jq -r '.errors // 0')
+            total_events=$((total_events + inserted))
+            total_errors=$((total_errors + errs))
+
+            if [ "$(echo "$response" | jq -r '.done')" = "true" ]; then
+              echo "✓ sync complete"
+              break
+            fi
+
+            offset=$(echo "$response" | jq -r '.nextOffset')
+
+            # Breathing room between batches so we stay under the API rate limit.
+            sleep 5
+          done
+
+          echo "### Webflow sync" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Events inserted: **${total_events}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Site errors: **${total_errors}**" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$total_errors" -gt 0 ]; then
+            echo "::warning::${total_errors} sites failed to sync — check /api/stats or the sites table."
+          fi
