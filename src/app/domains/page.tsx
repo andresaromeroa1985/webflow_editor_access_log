@@ -62,7 +62,8 @@ export default async function DomainsPage({
     );
   }
 
-  const { totalSites, none, unpublished, live } = overview;
+  const { totalSites, none, unpublished, live, activitySupported, unpopulated } =
+    overview;
   const pct = (n: number) =>
     totalSites > 0 ? Math.round((n / totalSites) * 100) : 0;
 
@@ -74,8 +75,21 @@ export default async function DomainsPage({
     );
   }
 
+  // Every site defaulting to 'none' means the roster refresh hasn't run since
+  // migration 0002 — not that nobody has a domain.
+  const looksUnpopulated = unpopulated === totalSites;
+
   return (
     <>
+      {looksUnpopulated && (
+        <div className="notice">
+          <strong>Domain data hasn&apos;t been collected yet.</strong> All{" "}
+          {totalSites} sites are showing the migration default. Run a sync at{" "}
+          <code>/api/sync?offset=0</code> — the roster refresh is what populates
+          these columns — then reload.
+        </div>
+      )}
+
       <div className="headline">
         <div className="big">
           <span className="accent">{live}</span> of {totalSites} sites are live
@@ -109,6 +123,15 @@ export default async function DomainsPage({
           <div className="value">{totalSites.toLocaleString()}</div>
         </div>
       </div>
+
+      {activitySupported !== totalSites && (
+        <p className="muted" style={{ fontSize: 12, marginTop: -12 }}>
+          This page counts all {totalSites} sites in the workspace. The
+          dashboard shows {activitySupported} because{" "}
+          {totalSites - activitySupported} sites return an error on the activity
+          log endpoint — their domain status is still accurate here.
+        </p>
+      )}
 
       {unpublished > 0 && (
         <div className="notice">
