@@ -1,5 +1,11 @@
 import { CLIENT_EVENT_PREDICATE, daysAgoIso } from "./db";
-import type { SiteSummaryRow, UnclassifiedUserRow } from "./types";
+import type {
+  DomainOverview,
+  DomainSiteRow,
+  DomainState,
+  SiteSummaryRow,
+  UnclassifiedUserRow,
+} from "./types";
 
 export interface Overview {
   windowDays: number;
@@ -108,6 +114,8 @@ export async function getSiteSummaries(
          s.last_synced_at,
          s.sync_error,
          s.activity_supported,
+         s.domain_state,
+         s.custom_domain_count,
          COALESCE(w.client_events, 0)  AS client_events,
          COALESCE(w.client_editors, 0) AS client_editors,
          a.last_client_edit,
@@ -134,6 +142,70 @@ export async function getSiteSummaries(
     )
     .bind(since, limit)
     .all<SiteSummaryRow>();
+
+  return results ?? [];
+}
+
+/**
+ * Custom domain breakdown across the portfolio.
+ *
+ * Three states, all derived from the `customDomains` array that List Sites
+ * already returns during the roster refresh — no extra API calls:
+ *
+ *   none        - no custom domain attached; still on *.webflow.io
+ *   unpublished - domain attached but never published to it (half-finished)
+ *   live        - published to at least one custom domain
+ */
+export async function getDomainOverview(
+  db: D1Database,
+): Promise<DomainOverview> {
+  const row = await db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN domain_state = 'none'        THEN 1 ELSE 0 END) AS none_count,
+         SUM(CASE WHEN domain_state = 'unpublished' THEN 1 ELSE 0 END) AS unpublished_count,
+         SUM(CASE WHEN domain_state = 'live'        THEN 1 ELSE 0 END) AS live_count
+       FROM sites`,
+    )
+    .first<{
+      total: number;
+      none_count: number;
+      unpublished_count: number;
+      live_count: number;
+    }>();
+
+  return {
+    totalSites: row?.total ?? 0,
+    none: row?.none_count ?? 0,
+    unpublished: row?.unpublished_count ?? 0,
+    live: row?.live_count ?? 0,
+  };
+}
+
+/** Sites for the domains table, optionally filtered to one state. */
+export async function getDomainSites(
+  db: D1Database,
+  state?: DomainState,
+  limit = 1000,
+): Promise<DomainSiteRow[]> {
+  const where = state ? `WHERE domain_state = ?1` : ``;
+  const stmt = db.prepare(
+    `SELECT
+       id, display_name, short_name, domain_state, custom_domain_count,
+       custom_domains_json, domain_last_published, last_published
+     FROM sites
+     ${where}
+     ORDER BY
+       CASE domain_state WHEN 'unpublished' THEN 0 WHEN 'none' THEN 1 ELSE 2 END,
+       display_name
+     LIMIT ${state ? "?2" : "?1"}`,
+  );
+
+  const { results } = await (state
+    ? stmt.bind(state, limit)
+    : stmt.bind(limit)
+  ).all<DomainSiteRow>();
 
   return results ?? [];
 }
