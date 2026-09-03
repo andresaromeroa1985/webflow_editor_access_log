@@ -36,6 +36,7 @@ export default function RootLayout({
             </div>
             <nav className="nav">
               <a href={`${basePath}/`}>Dashboard</a>
+              <a href={`${basePath}/domains`}>Domains</a>
               <a href={`${basePath}/users`}>Users</a>
               <a href={`${basePath}/api/stats?days=30&format=csv`}>CSV</a>
             </nav>
