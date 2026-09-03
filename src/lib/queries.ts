@@ -159,13 +159,21 @@ export async function getSiteSummaries(
 export async function getDomainOverview(
   db: D1Database,
 ): Promise<DomainOverview> {
+  // NOTE ON THE DENOMINATOR
+  // This page counts EVERY site in the workspace, because domain configuration
+  // is independent of whether we can read a site's activity log. The dashboard
+  // counts only sites where activity_supported = 1, so its total is smaller.
+  // `activitySupported` is returned so the page can explain the difference
+  // rather than leaving two contradictory totals on screen.
   const row = await db
     .prepare(
       `SELECT
          COUNT(*) AS total,
          SUM(CASE WHEN domain_state = 'none'        THEN 1 ELSE 0 END) AS none_count,
          SUM(CASE WHEN domain_state = 'unpublished' THEN 1 ELSE 0 END) AS unpublished_count,
-         SUM(CASE WHEN domain_state = 'live'        THEN 1 ELSE 0 END) AS live_count
+         SUM(CASE WHEN domain_state = 'live'        THEN 1 ELSE 0 END) AS live_count,
+         SUM(CASE WHEN activity_supported = 1       THEN 1 ELSE 0 END) AS activity_supported_count,
+         SUM(CASE WHEN custom_domains_json IS NULL AND domain_state = 'none' THEN 1 ELSE 0 END) AS unpopulated
        FROM sites`,
     )
     .first<{
@@ -173,6 +181,8 @@ export async function getDomainOverview(
       none_count: number;
       unpublished_count: number;
       live_count: number;
+      activity_supported_count: number;
+      unpopulated: number;
     }>();
 
   return {
@@ -180,6 +190,8 @@ export async function getDomainOverview(
     none: row?.none_count ?? 0,
     unpublished: row?.unpublished_count ?? 0,
     live: row?.live_count ?? 0,
+    activitySupported: row?.activity_supported_count ?? 0,
+    unpopulated: row?.unpopulated ?? 0,
   };
 }
 
