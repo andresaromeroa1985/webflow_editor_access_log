@@ -6,7 +6,7 @@ import {
   listSites,
   mapWithConcurrency,
 } from "@/lib/webflow";
-import type { WebflowActivityEvent } from "@/lib/types";
+import type { WebflowActivityEvent, DomainState } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -72,16 +72,40 @@ async function handle(req: NextRequest) {
     for (let i = 0; i < sites.length; i += 50) {
       const chunk = sites.slice(i, i + 50);
       await db.batch(
-        chunk.map((s) =>
-          db
+        chunk.map((s) => {
+          const domains = s.customDomains ?? [];
+          const published = domains
+            .map((d) => d.lastPublished)
+            .filter((v): v is string => Boolean(v))
+            .sort();
+          const domainLastPublished =
+            published.length > 0 ? published[published.length - 1] : null;
+
+          // none        - still on *.webflow.io
+          // unpublished - domain attached, never published to it
+          // live        - published to at least one custom domain
+          const domainState: DomainState =
+            domains.length === 0
+              ? "none"
+              : domainLastPublished
+                ? "live"
+                : "unpublished";
+
+          return db
             .prepare(
-              `INSERT INTO sites (id, display_name, short_name, workspace_id, last_published)
-               VALUES (?1, ?2, ?3, ?4, ?5)
+              `INSERT INTO sites
+                 (id, display_name, short_name, workspace_id, last_published,
+                  custom_domains_json, custom_domain_count, domain_last_published, domain_state)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                ON CONFLICT(id) DO UPDATE SET
-                 display_name   = excluded.display_name,
-                 short_name     = excluded.short_name,
-                 workspace_id   = excluded.workspace_id,
-                 last_published = excluded.last_published`,
+                 display_name          = excluded.display_name,
+                 short_name            = excluded.short_name,
+                 workspace_id          = excluded.workspace_id,
+                 last_published        = excluded.last_published,
+                 custom_domains_json   = excluded.custom_domains_json,
+                 custom_domain_count   = excluded.custom_domain_count,
+                 domain_last_published = excluded.domain_last_published,
+                 domain_state          = excluded.domain_state`,
             )
             .bind(
               s.id,
@@ -89,8 +113,12 @@ async function handle(req: NextRequest) {
               s.shortName ?? null,
               s.workspaceId ?? null,
               s.lastPublished ?? null,
-            ),
-        ),
+              domains.length > 0 ? JSON.stringify(domains) : null,
+              domains.length,
+              domainLastPublished,
+              domainState,
+            );
+        }),
       );
     }
   }
