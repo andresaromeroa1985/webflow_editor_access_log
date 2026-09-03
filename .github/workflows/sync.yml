@@ -10,22 +10,22 @@ on:
   workflow_dispatch:
     inputs:
       batch:
-        description: "Sites per request"
-        default: "25"
+        description: "Sites per request (lower this if you see 504s)"
+        default: "10"
         required: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Page through all sites
         env:
-          APP_URL: ${{ secrets.APP_URL }} # e.g. https://sites.spoton.com/editor-log
+          APP_URL: ${{ secrets.APP_URL }} # e.g. https://your-app.webflow.io
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          BATCH: ${{ github.event.inputs.batch || '25' }}
+          BATCH: ${{ github.event.inputs.batch || '10' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           if [ -z "${APP_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
             echo "::error::APP_URL and CRON_SECRET repository secrets must be set."
@@ -35,16 +35,47 @@ jobs:
           offset=0
           total_events=0
           total_errors=0
+          giveups=0
+          MAX_RETRIES=3
 
-          for i in $(seq 1 200); do
-            echo "→ batch at offset=$offset"
+          for i in $(seq 1 500); do
+            attempt=0
+            response=""
 
-            response=$(curl -sS --fail-with-body \
-              --max-time 300 \
-              -H "Authorization: Bearer ${CRON_SECRET}" \
-              "${APP_URL}/api/sync?offset=${offset}&batch=${BATCH}")
+            # A batch can exceed the Worker's wall-clock budget and return 504.
+            # Retrying the same offset is safe and cheap: every site already
+            # synced carries a watermark, so the retry skips straight past it.
+            while [ "$attempt" -lt "$MAX_RETRIES" ]; do
+              attempt=$((attempt + 1))
 
-            echo "$response" | jq -c '{done, nextOffset, sitesProcessed, eventsInserted, errors}'
+              http_code=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+                --max-time 300 \
+                -H "Authorization: Bearer ${CRON_SECRET}" \
+                "${APP_URL}/api/sync?offset=${offset}&batch=${BATCH}" || echo "000")
+
+              if [ "$http_code" = "200" ]; then
+                response=$(cat /tmp/resp.json)
+                break
+              fi
+
+              echo "  offset=${offset} attempt ${attempt}/${MAX_RETRIES} failed (HTTP ${http_code})"
+
+              if [ "$http_code" = "401" ]; then
+                echo "::error::401 Unauthorized — CRON_SECRET does not match the app's env var, or the app is behind workspace access control that blocks this runner."
+                exit 1
+              fi
+
+              sleep 10
+            done
+
+            if [ -z "$response" ]; then
+              echo "::warning::Giving up on offset=${offset} after ${MAX_RETRIES} attempts; skipping ahead."
+              giveups=$((giveups + 1))
+              offset=$((offset + BATCH))
+              continue
+            fi
+
+            echo "$response" | jq -c '{offset, totalSites, sitesProcessed, eventsInserted, errors}'
 
             inserted=$(echo "$response" | jq -r '.eventsInserted // 0')
             errs=$(echo "$response" | jq -r '.errors // 0')
@@ -57,15 +88,20 @@ jobs:
             fi
 
             offset=$(echo "$response" | jq -r '.nextOffset')
-
-            # Breathing room between batches so we stay under the API rate limit.
-            sleep 5
+            sleep 3
           done
 
-          echo "### Webflow sync" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Events inserted: **${total_events}**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Site errors: **${total_errors}**" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Webflow sync"
+            echo "- Events inserted: **${total_events}**"
+            echo "- Site errors: **${total_errors}**"
+            echo "- Batches abandoned: **${giveups}**"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$total_errors" -gt 0 ]; then
-            echo "::warning::${total_errors} sites failed to sync — check /api/stats or the sites table."
+            echo "::warning::${total_errors} sites reported errors — check the sites table for sync_error values."
+          fi
+
+          if [ "$giveups" -gt 0 ]; then
+            echo "::warning::${giveups} batches timed out repeatedly and were skipped. They'll be retried on the next run; if it persists, lower the batch input."
           fi
