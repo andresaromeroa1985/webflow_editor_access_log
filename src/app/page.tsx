@@ -1,11 +1,18 @@
 import { getEnvAsync, daysSince, fmtDate } from "@/lib/db";
 import { getOverview, getSiteSummaries } from "@/lib/queries";
-import type { SiteSummaryRow } from "@/lib/types";
+import type { DomainState, SiteSummaryRow } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
 const WINDOWS = [7, 30, 90, 365];
 const basePath = process.env.BASE_URL || "";
+
+function DomainPill({ state }: { state: DomainState }) {
+  if (state === "live") return <span className="pill active">Live</span>;
+  if (state === "unpublished")
+    return <span className="pill client">Not published</span>;
+  return <span className="pill never">None</span>;
+}
 
 function ActivityPill({ row }: { row: SiteSummaryRow }) {
   if (!row.last_client_edit) {
@@ -160,6 +167,7 @@ export default async function Dashboard({
                 <th className="num">Client users</th>
                 <th>Last client edit</th>
                 <th>Last activity</th>
+                <th>Domain</th>
                 <th>Status</th>
               </tr>
             </thead>
@@ -199,6 +207,9 @@ export default async function Dashboard({
                   </td>
                   <td>{fmtDate(s.last_client_edit)}</td>
                   <td className="muted">{fmtDate(s.last_any_edit)}</td>
+                  <td>
+                    <DomainPill state={s.domain_state} />
+                  </td>
                   <td>
                     <ActivityPill row={s} />
                   </td>
