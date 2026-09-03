@@ -80,10 +80,15 @@ export interface DomainSiteRow {
 }
 
 export interface DomainOverview {
+  /** Every site in the workspace — domain config is independent of activity-log access. */
   totalSites: number;
   none: number;
   unpublished: number;
   live: number;
+  /** Sites whose activity log is readable; the dashboard's smaller denominator. */
+  activitySupported: number;
+  /** Sites the roster refresh has never written domain data for. */
+  unpopulated: number;
 }
 
 export interface UnclassifiedUserRow {
