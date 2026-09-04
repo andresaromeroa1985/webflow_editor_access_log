@@ -105,3 +105,43 @@ jobs:
           if [ "$giveups" -gt 0 ]; then
             echo "::warning::${giveups} batches timed out repeatedly and were skipped. They'll be retried on the next run; if it persists, lower the batch input."
           fi
+
+      - name: Registrar enrichment (RDAP + name.com)
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -uo pipefail
+
+          # Looks up registrars for domains never checked or checked >30 days
+          # ago, 25 per call, until none remain. Also refreshes the name.com
+          # account match once per 24h (when credentials are configured).
+          # Steady state this is a handful of calls; the first run is ~25.
+
+          total_checked=0
+          for i in $(seq 1 100); do
+            http_code=$(curl -sS -o /tmp/enrich.json -w "%{http_code}" \
+              --max-time 300 \
+              -H "Authorization: Bearer ${CRON_SECRET}" \
+              "${APP_URL}/api/domains/enrich?limit=25" || echo "000")
+
+            if [ "$http_code" != "200" ]; then
+              echo "::warning::enrich returned HTTP ${http_code}; stopping. Remaining domains will be picked up tomorrow."
+              break
+            fi
+
+            jq -c '{done, rdap: {checked: .rdap.checked, remaining: .rdap.remaining, errors: .rdap.errors}, namecom: .namecom}' /tmp/enrich.json
+
+            checked=$(jq -r '.rdap.checked // 0' /tmp/enrich.json)
+            total_checked=$((total_checked + checked))
+
+            if [ "$(jq -r '.done' /tmp/enrich.json)" = "true" ]; then
+              echo "✓ enrichment complete"
+              break
+            fi
+
+            # Be polite to the registries.
+            sleep 3
+          done
+
+          echo "- Registrar lookups performed: **${total_checked}**" >> "$GITHUB_STEP_SUMMARY"
