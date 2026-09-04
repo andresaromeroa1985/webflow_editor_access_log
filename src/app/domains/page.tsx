@@ -1,6 +1,17 @@
 import { getEnvAsync, fmtDate } from "@/lib/db";
-import { getDomainOverview, getDomainSites } from "@/lib/queries";
-import type { DomainSiteRow, DomainState, WebflowCustomDomain } from "@/lib/types";
+import {
+  getDomainOverview,
+  getDomainSites,
+  getEnrichmentStatus,
+  getRegistrarBreakdown,
+} from "@/lib/queries";
+import type {
+  DomainSiteRow,
+  DomainState,
+  EnrichmentStatus,
+  RegistrarCount,
+  WebflowCustomDomain,
+} from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -31,6 +42,98 @@ function domainList(row: DomainSiteRow): string {
   }
 }
 
+function RegistrarCell({ row }: { row: DomainSiteRow }) {
+  if (!row.apex_domain) return <span className="muted">—</span>;
+
+  if (row.rdap_status === null || row.rdap_status === undefined) {
+    return <span className="muted">pending</span>;
+  }
+
+  let label: string;
+  let muted = false;
+  if (row.registrar_name) {
+    label = row.registrar_name;
+  } else if (row.rdap_status === "not_found") {
+    label = "Not registered";
+    muted = true;
+  } else if (row.rdap_status === "unsupported_tld") {
+    label = "No RDAP for TLD";
+    muted = true;
+  } else if (row.rdap_status === "error") {
+    label = "Lookup error";
+    muted = true;
+  } else {
+    label = "Unknown";
+    muted = true;
+  }
+
+  return (
+    <>
+      <span className={muted ? "muted" : ""}>{label}</span>
+      {row.in_namecom_account === 1 && (
+        <span className="pill internal" style={{ marginLeft: 8 }}>
+          SpotOn
+        </span>
+      )}
+    </>
+  );
+}
+
+function RegistrarPanel({
+  rows,
+  enrichment,
+}: {
+  rows: RegistrarCount[];
+  enrichment: EnrichmentStatus;
+}) {
+  if (rows.length === 0) return null;
+  const total = rows.reduce((n, r) => n + r.sites, 0);
+
+  return (
+    <div className="panel" style={{ marginBottom: 20 }}>
+      <h2>
+        Registrars
+        <span className="count">
+          {enrichment.checked} of {enrichment.totalDomains} domains looked up
+          {enrichment.namecomSyncedAt
+            ? ` · ${enrichment.namecomManaged} in SpotOn's name.com account`
+            : ""}
+        </span>
+      </h2>
+      <div className="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Registrar</th>
+              <th className="num">Sites</th>
+              <th className="num">Share</th>
+              <th className="num">SpotOn-managed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.registrar}>
+                <td>{r.registrar}</td>
+                <td className="num">{r.sites.toLocaleString()}</td>
+                <td className="num muted">
+                  {total > 0 ? Math.round((r.sites / total) * 100) : 0}%
+                </td>
+                <td className="num">
+                  {r.spoton_managed > 0 ? (
+                    r.spoton_managed
+                  ) : (
+                    <span className="muted">0</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export default async function DomainsPage({
   searchParams,
 }: {
@@ -45,16 +148,21 @@ export default async function DomainsPage({
 
   let overview;
   let sites: DomainSiteRow[] = [];
+  let registrars: RegistrarCount[] = [];
+  let enrichment: EnrichmentStatus | null = null;
   try {
-    [overview, sites] = await Promise.all([
+    [overview, sites, registrars, enrichment] = await Promise.all([
       getDomainOverview(env.DB),
       getDomainSites(env.DB, filter),
+      getRegistrarBreakdown(env.DB),
+      getEnrichmentStatus(env.DB),
     ]);
   } catch (err) {
     return (
       <div className="notice">
-        <strong>Domain data not available.</strong> This needs migration{" "}
-        <code>0002_domains.sql</code> applied and one sync run to populate it.
+        <strong>Domain data not available.</strong> This needs migrations{" "}
+        <code>0002</code> and <code>0003</code> applied and one sync run to
+        populate it.
         <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
           {err instanceof Error ? err.message : String(err)}
         </div>
@@ -75,9 +183,8 @@ export default async function DomainsPage({
     );
   }
 
-  // Every site defaulting to 'none' means the roster refresh hasn't run since
-  // migration 0002 — not that nobody has a domain.
   const looksUnpopulated = unpopulated === totalSites;
+  const enrichmentPending = enrichment.unchecked > 0;
 
   return (
     <>
@@ -87,6 +194,17 @@ export default async function DomainsPage({
           {totalSites} sites are showing the migration default. Run a sync at{" "}
           <code>/api/sync?offset=0</code> — the roster refresh is what populates
           these columns — then reload.
+        </div>
+      )}
+
+      {!looksUnpopulated && enrichmentPending && (
+        <div className="notice">
+          <strong>
+            {enrichment.unchecked} of {enrichment.totalDomains} domains
+          </strong>{" "}
+          haven&apos;t had a registrar lookup yet. They show as{" "}
+          <em>pending</em> below. The nightly job fills these in; to do it now,
+          call <code>/api/domains/enrich</code> until it reports done.
         </div>
       )}
 
@@ -135,11 +253,16 @@ export default async function DomainsPage({
 
       {unpublished > 0 && (
         <div className="notice">
-          <strong>{unpublished} sites have a domain attached that was never
-          published to.</strong> These are usually half-finished launches — DNS
-          was configured but the site was never pushed live on it.
+          <strong>
+            {unpublished} sites have a domain attached that was never published
+            to.
+          </strong>{" "}
+          These are usually half-finished launches — DNS was configured but the
+          site was never pushed live on it.
         </div>
       )}
+
+      <RegistrarPanel rows={registrars} enrichment={enrichment} />
 
       <div className="windows">
         {STATES.map((s) => {
@@ -166,7 +289,7 @@ export default async function DomainsPage({
               <tr>
                 <th>Site</th>
                 <th>Custom domain</th>
-                <th className="num">Domains</th>
+                <th>Registrar</th>
                 <th>Domain last published</th>
                 <th>Site last published</th>
                 <th>Status</th>
@@ -178,13 +301,14 @@ export default async function DomainsPage({
                   <td>{s.display_name}</td>
                   <td className={s.custom_domain_count ? "" : "muted"}>
                     {domainList(s)}
-                  </td>
-                  <td className="num">
-                    {s.custom_domain_count > 0 ? (
-                      s.custom_domain_count
-                    ) : (
-                      <span className="muted">0</span>
+                    {s.custom_domain_count > 1 && (
+                      <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>
+                        ({s.custom_domain_count})
+                      </span>
                     )}
+                  </td>
+                  <td>
+                    <RegistrarCell row={s} />
                   </td>
                   <td>{fmtDate(s.domain_last_published)}</td>
                   <td className="muted">{fmtDate(s.last_published)}</td>
