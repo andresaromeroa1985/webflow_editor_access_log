@@ -12,26 +12,38 @@ export const dynamic = "force-dynamic";
 const RDAP_RECHECK_DAYS = 30;
 const NAMECOM_RECHECK_HOURS = 24;
 
+/** D1 caps bound parameters per statement at 100; stay comfortably under. */
+const IN_CHUNK = 50;
+/** Statements per db.batch() call. */
+const BATCH_CHUNK = 25;
+
 /**
  * Registrar enrichment, batched like /api/sync.
  *
- *   GET /api/domains/enrich?limit=25      -> { remaining: 528, ... }
- *   GET /api/domains/enrich?limit=25      -> { remaining: 503, ... }
- *   ...                                   -> { remaining: 0 }
+ *   GET /api/domains/enrich?namecom=1&limit=0   -> name.com sync only
+ *   GET /api/domains/enrich?limit=20            -> 20 RDAP lookups
+ *   GET /api/domains/enrich?limit=20            -> 20 more ...
+ *   ...                                         -> { done: true }
  *
- * Two independent jobs run here:
+ * Two independent jobs:
  *
- * 1. name.com account sync (whole account, at most once per 24h). One paginated
- *    call returns every domain SpotOn holds; we flag matches. Cheap.
+ * 1. name.com account sync — flags which of OUR domains sit in SpotOn's
+ *    name.com account. Runs when forced (`namecom=1`) or when the last sync is
+ *    older than 24h. Iterates our ~550 domains, not the account's (which may be
+ *    thousands), and writes in a handful of batched statements.
  *
- * 2. RDAP registrar lookups for domains never checked, or checked more than
- *    30 days ago. One HTTP request per domain against the registry, so this is
- *    the part that's batched. Registrars rarely change; monthly is plenty.
+ * 2. RDAP registrar lookups — one HTTP request per domain against the registry
+ *    for anything never checked or checked >30 days ago. This is the part that
+ *    gets paged with `limit`.
+ *
+ * Keeping each call small matters: a Worker invocation has a wall-clock budget
+ * and the gateway returns 504 past it. The nightly workflow does name.com first
+ * as its own call, then loops RDAP.
  *
  * Query params:
- *   limit     RDAP lookups per call (default 25, max 100)
- *   namecom=1 force a name.com resync regardless of the 24h window
- *   force=1   treat every domain as stale (full RDAP recheck)
+ *   limit      RDAP lookups this call (default 20, max 50, 0 = skip RDAP)
+ *   namecom=1  force a name.com resync regardless of the 24h window
+ *   force=1    treat every domain as RDAP-stale (full recheck)
  */
 export async function GET(req: NextRequest) {
   const env = getEnv();
@@ -44,10 +56,11 @@ export async function GET(req: NextRequest) {
   }
 
   const url = new URL(req.url);
-  const limit = Math.min(
-    100,
-    Math.max(1, Number(url.searchParams.get("limit") ?? "25") || 25),
-  );
+  const rawLimit = url.searchParams.get("limit");
+  const limit =
+    rawLimit === null
+      ? 20
+      : Math.min(50, Math.max(0, Number(rawLimit) || 0));
   const forceNamecom = url.searchParams.get("namecom") === "1";
   const forceAll = url.searchParams.get("force") === "1";
 
@@ -72,41 +85,50 @@ export async function GET(req: NextRequest) {
           env.NAMECOM_TOKEN,
         );
 
-        // Reset everyone to "not ours", then flag the matches.
-        await db
-          .prepare(
-            `UPDATE domains SET in_namecom_account = 0, namecom_checked_at = ?1`,
-          )
-          .bind(now)
-          .run();
+        // Walk OUR domains (~hundreds), not the account's (maybe thousands).
+        const { results: mine } = await db
+          .prepare(`SELECT domain FROM domains`)
+          .all<{ domain: string }>();
+        const matches = (mine ?? [])
+          .map((r) => r.domain)
+          .filter((d) => ours.has(d));
 
-        const list = [...ours];
-        let flagged = 0;
-        for (let i = 0; i < list.length; i += 50) {
-          const chunk = list.slice(i, i + 50);
-          const placeholders = chunk.map((_, k) => `?${k + 2}`).join(",");
-          const r = await db
+        const stmts: D1PreparedStatement[] = [
+          db
             .prepare(
-              `UPDATE domains SET in_namecom_account = 1, namecom_checked_at = ?1
-                WHERE domain IN (${placeholders})`,
+              `UPDATE domains SET in_namecom_account = 0, namecom_checked_at = ?1`,
             )
-            .bind(now, ...chunk)
-            .run();
-          flagged += r.meta.changes ?? 0;
+            .bind(now),
+        ];
+        for (let i = 0; i < matches.length; i += IN_CHUNK) {
+          const chunk = matches.slice(i, i + IN_CHUNK);
+          const placeholders = chunk.map((_, k) => `?${k + 1}`).join(",");
+          stmts.push(
+            db
+              .prepare(
+                `UPDATE domains SET in_namecom_account = 1 WHERE domain IN (${placeholders})`,
+              )
+              .bind(...chunk),
+          );
         }
+        stmts.push(
+          db
+            .prepare(
+              `INSERT INTO meta (key, value, updated_at) VALUES ('namecom_synced_at', ?1, ?1)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+            )
+            .bind(now),
+        );
 
-        await db
-          .prepare(
-            `INSERT INTO meta (key, value, updated_at) VALUES ('namecom_synced_at', ?1, ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-          )
-          .bind(now)
-          .run();
+        for (let i = 0; i < stmts.length; i += BATCH_CHUNK) {
+          await db.batch(stmts.slice(i, i + BATCH_CHUNK));
+        }
 
         result.namecom = {
           synced: true,
           accountDomains: ours.size,
-          matchedInPortfolio: flagged,
+          portfolioDomains: (mine ?? []).length,
+          matchedInPortfolio: matches.length,
         };
       } catch (err) {
         result.namecom = {
@@ -115,10 +137,17 @@ export async function GET(req: NextRequest) {
         };
       }
     } else {
-      result.namecom = { synced: false, reason: "fresh", lastSync: last?.updated_at };
+      result.namecom = {
+        synced: false,
+        reason: "fresh",
+        lastSync: last?.updated_at,
+      };
     }
   } else {
-    result.namecom = { synced: false, reason: "NAMECOM_USERNAME / NAMECOM_TOKEN not set" };
+    result.namecom = {
+      synced: false,
+      reason: "NAMECOM_USERNAME / NAMECOM_TOKEN not set",
+    };
   }
 
   // ---- 2. RDAP registrar lookups ------------------------------------------
@@ -126,87 +155,94 @@ export async function GET(req: NextRequest) {
     Date.now() - RDAP_RECHECK_DAYS * 86_400_000,
   ).toISOString();
 
-  const staleClause = forceAll
-    ? `1 = 1`
-    : `(rdap_checked_at IS NULL OR rdap_checked_at < ?1)`;
-
-  const { results } = await db
-    .prepare(
-      `SELECT domain FROM domains
-        WHERE ${staleClause}
-        ORDER BY (rdap_checked_at IS NOT NULL), domain
-        LIMIT ${forceAll ? "?1" : "?2"}`,
-    )
-    .bind(...(forceAll ? [limit] : [staleBefore, limit]))
-    .all<{ domain: string }>();
-
-  const targets: string[] = (results ?? []).map((r) => r.domain);
   let checked = 0;
   let okCount = 0;
   let errCount = 0;
   const sample: { domain: string; registrar: string | null; status: string }[] = [];
 
-  if (targets.length > 0) {
-    const bootstrap = await loadRdapBootstrap(db);
+  if (limit > 0) {
+    const staleClause = forceAll
+      ? `1 = 1`
+      : `(rdap_checked_at IS NULL OR rdap_checked_at < ?1)`;
 
-    // Concurrency 2 + a short pause keeps us well under registry rate limits.
-    const outcomes = await mapWithConcurrency(targets, 2, async (apex) => {
-      const r = await rdapLookup(apex, bootstrap);
-      await new Promise((res) => setTimeout(res, 150));
-      return { apex, r };
-    });
+    const { results } = await db
+      .prepare(
+        `SELECT domain FROM domains
+          WHERE ${staleClause}
+          ORDER BY (rdap_checked_at IS NOT NULL), domain
+          LIMIT ${forceAll ? "?1" : "?2"}`,
+      )
+      .bind(...(forceAll ? [limit] : [staleBefore, limit]))
+      .all<{ domain: string }>();
 
-    for (const { apex, r } of outcomes) {
-      checked++;
-      if (r.status === "ok") okCount++;
-      if (r.status === "error") errCount++;
-      if (sample.length < 5) {
-        sample.push({ domain: apex, registrar: r.registrarName, status: r.status });
+    const targets: string[] = (results ?? []).map((r) => r.domain);
+
+    if (targets.length > 0) {
+      const bootstrap = await loadRdapBootstrap(db);
+
+      // Concurrency 3 + a short pause keeps us under registry rate limits.
+      const outcomes = await mapWithConcurrency(targets, 3, async (apex) => {
+        const r = await rdapLookup(apex, bootstrap);
+        await new Promise((res) => setTimeout(res, 100));
+        return { apex, r };
+      });
+
+      const stmts: D1PreparedStatement[] = [];
+      for (const { apex, r } of outcomes) {
+        checked++;
+        if (r.status === "ok") okCount++;
+        if (r.status === "error") errCount++;
+        if (sample.length < 5) {
+          sample.push({ domain: apex, registrar: r.registrarName, status: r.status });
+        }
+        stmts.push(
+          db
+            .prepare(
+              `UPDATE domains
+                  SET registrar_name    = ?2,
+                      registrar_iana_id = ?3,
+                      rdap_status       = ?4,
+                      rdap_error        = ?5,
+                      rdap_checked_at   = ?6
+                WHERE domain = ?1`,
+            )
+            .bind(
+              apex,
+              r.registrarName,
+              r.registrarIanaId,
+              r.status,
+              r.error ? r.error.slice(0, 300) : null,
+              now,
+            ),
+        );
       }
-
-      await db
-        .prepare(
-          `UPDATE domains
-              SET registrar_name    = ?2,
-                  registrar_iana_id = ?3,
-                  rdap_status       = ?4,
-                  rdap_error        = ?5,
-                  rdap_checked_at   = ?6
-            WHERE domain = ?1`,
-        )
-        .bind(
-          apex,
-          r.registrarName,
-          r.registrarIanaId,
-          r.status,
-          r.error ? r.error.slice(0, 300) : null,
-          now,
-        )
-        .run();
+      for (let i = 0; i < stmts.length; i += BATCH_CHUNK) {
+        await db.batch(stmts.slice(i, i + BATCH_CHUNK));
+      }
     }
   }
 
-  const remainingRow = await db
+  const counts = await db
     .prepare(
-      `SELECT COUNT(*) AS n FROM domains
-        WHERE rdap_checked_at IS NULL OR rdap_checked_at < ?1`,
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN rdap_checked_at IS NULL OR rdap_checked_at < ?1 THEN 1 ELSE 0 END) AS remaining
+       FROM domains`,
     )
     .bind(staleBefore)
-    .first<{ n: number }>();
+    .first<{ total: number; remaining: number }>();
 
-  const totalRow = await db
-    .prepare(`SELECT COUNT(*) AS n FROM domains`)
-    .first<{ n: number }>();
+  const remaining = counts?.remaining ?? 0;
 
   result.rdap = {
     checked,
     ok: okCount,
     errors: errCount,
-    remaining: remainingRow?.n ?? 0,
-    totalDomains: totalRow?.n ?? 0,
+    remaining,
+    totalDomains: counts?.total ?? 0,
     sample,
   };
-  result.done = (remainingRow?.n ?? 0) === 0;
+  result.done = remaining === 0;
 
   return NextResponse.json(result);
 }
