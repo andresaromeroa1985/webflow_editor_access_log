@@ -3,6 +3,8 @@ import type {
   DomainOverview,
   DomainSiteRow,
   DomainState,
+  EnrichmentStatus,
+  RegistrarCount,
   SiteSummaryRow,
   UnclassifiedUserRow,
 } from "./types";
@@ -195,22 +197,24 @@ export async function getDomainOverview(
   };
 }
 
-/** Sites for the domains table, optionally filtered to one state. */
+/** Sites for the domains table, optionally filtered to one state, with registrar joined in. */
 export async function getDomainSites(
   db: D1Database,
   state?: DomainState,
   limit = 1000,
 ): Promise<DomainSiteRow[]> {
-  const where = state ? `WHERE domain_state = ?1` : ``;
+  const where = state ? `WHERE s.domain_state = ?1` : ``;
   const stmt = db.prepare(
     `SELECT
-       id, display_name, short_name, domain_state, custom_domain_count,
-       custom_domains_json, domain_last_published, last_published
-     FROM sites
+       s.id, s.display_name, s.short_name, s.domain_state, s.custom_domain_count,
+       s.custom_domains_json, s.domain_last_published, s.last_published, s.apex_domain,
+       d.registrar_name, d.rdap_status, d.in_namecom_account
+     FROM sites s
+     LEFT JOIN domains d ON d.domain = s.apex_domain
      ${where}
      ORDER BY
-       CASE domain_state WHEN 'unpublished' THEN 0 WHEN 'none' THEN 1 ELSE 2 END,
-       display_name
+       CASE s.domain_state WHEN 'unpublished' THEN 0 WHEN 'none' THEN 1 ELSE 2 END,
+       s.display_name
      LIMIT ${state ? "?2" : "?1"}`,
   );
 
@@ -220,6 +224,69 @@ export async function getDomainSites(
   ).all<DomainSiteRow>();
 
   return results ?? [];
+}
+
+/**
+ * Sites per registrar, for sites that actually have a custom domain.
+ * `spoton_managed` = how many of those are in SpotOn's own name.com account.
+ */
+export async function getRegistrarBreakdown(
+  db: D1Database,
+): Promise<RegistrarCount[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT
+         COALESCE(
+           d.registrar_name,
+           CASE
+             WHEN d.rdap_status IS NULL          THEN 'Not yet checked'
+             WHEN d.rdap_status = 'not_found'    THEN 'Not registered'
+             WHEN d.rdap_status = 'unsupported_tld' THEN 'TLD without RDAP'
+             WHEN d.rdap_status = 'error'        THEN 'Lookup error'
+             ELSE 'Unknown'
+           END
+         ) AS registrar,
+         COUNT(*) AS sites,
+         SUM(CASE WHEN d.in_namecom_account = 1 THEN 1 ELSE 0 END) AS spoton_managed
+       FROM sites s
+       LEFT JOIN domains d ON d.domain = s.apex_domain
+       WHERE s.domain_state != 'none' AND s.apex_domain IS NOT NULL
+       GROUP BY registrar
+       ORDER BY sites DESC, registrar`,
+    )
+    .all<RegistrarCount>();
+
+  return results ?? [];
+}
+
+/** How far along RDAP + name.com enrichment is. */
+export async function getEnrichmentStatus(
+  db: D1Database,
+): Promise<EnrichmentStatus> {
+  const counts = await db
+    .prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN rdap_checked_at IS NOT NULL THEN 1 ELSE 0 END) AS checked,
+         SUM(CASE WHEN in_namecom_account = 1 THEN 1 ELSE 0 END) AS namecom_managed
+       FROM domains`,
+    )
+    .first<{ total: number; checked: number; namecom_managed: number }>();
+
+  const synced = await db
+    .prepare(`SELECT updated_at FROM meta WHERE key = 'namecom_synced_at'`)
+    .first<{ updated_at: string }>();
+
+  const total = counts?.total ?? 0;
+  const checked = counts?.checked ?? 0;
+
+  return {
+    totalDomains: total,
+    checked,
+    unchecked: total - checked,
+    namecomSyncedAt: synced?.updated_at ?? null,
+    namecomManaged: counts?.namecom_managed ?? 0,
+  };
 }
 
 /**
