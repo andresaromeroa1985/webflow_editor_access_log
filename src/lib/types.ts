@@ -77,6 +77,25 @@ export interface DomainSiteRow {
   custom_domains_json: string | null;
   domain_last_published: string | null;
   last_published: string | null;
+  apex_domain: string | null;
+  // joined from `domains`
+  registrar_name: string | null;
+  rdap_status: string | null;
+  in_namecom_account: number | null;
+}
+
+export interface RegistrarCount {
+  registrar: string;
+  sites: number;
+  spoton_managed: number;
+}
+
+export interface EnrichmentStatus {
+  totalDomains: number;
+  checked: number;
+  unchecked: number;
+  namecomSyncedAt: string | null;
+  namecomManaged: number;
 }
 
 export interface DomainOverview {
