@@ -6,6 +6,7 @@ import {
   listSites,
   mapWithConcurrency,
 } from "@/lib/webflow";
+import { tldOf, toApexDomain } from "@/lib/domains";
 import type { WebflowActivityEvent, DomainState } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -69,6 +70,10 @@ async function handle(req: NextRequest) {
     const sites = await listSites(env.WEBFLOW_API_TOKEN);
     refreshedSites = sites.length;
 
+    // Every distinct registrable domain across the portfolio. Seeded into the
+    // `domains` table so /api/domains/enrich has something to look up.
+    const apexSet = new Set<string>();
+
     for (let i = 0; i < sites.length; i += 50) {
       const chunk = sites.slice(i, i + 50);
       await db.batch(
@@ -91,12 +96,23 @@ async function handle(req: NextRequest) {
                 ? "live"
                 : "unpublished";
 
+          // "www.peros.com" and "peros.com" collapse to one apex.
+          let apex: string | null = null;
+          for (const d of domains) {
+            const a = toApexDomain(d.url);
+            if (a) {
+              apexSet.add(a);
+              if (!apex) apex = a;
+            }
+          }
+
           return db
             .prepare(
               `INSERT INTO sites
                  (id, display_name, short_name, workspace_id, last_published,
-                  custom_domains_json, custom_domain_count, domain_last_published, domain_state)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                  custom_domains_json, custom_domain_count, domain_last_published,
+                  domain_state, apex_domain)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                ON CONFLICT(id) DO UPDATE SET
                  display_name          = excluded.display_name,
                  short_name            = excluded.short_name,
@@ -105,7 +121,8 @@ async function handle(req: NextRequest) {
                  custom_domains_json   = excluded.custom_domains_json,
                  custom_domain_count   = excluded.custom_domain_count,
                  domain_last_published = excluded.domain_last_published,
-                 domain_state          = excluded.domain_state`,
+                 domain_state          = excluded.domain_state,
+                 apex_domain           = excluded.apex_domain`,
             )
             .bind(
               s.id,
@@ -117,8 +134,25 @@ async function handle(req: NextRequest) {
               domains.length,
               domainLastPublished,
               domainState,
+              apex,
             );
         }),
+      );
+    }
+
+    // Seed the domains table. INSERT OR IGNORE keeps existing rows' registrar
+    // data intact; only genuinely new domains get a fresh (unchecked) row.
+    const apexList = [...apexSet];
+    for (let i = 0; i < apexList.length; i += 50) {
+      const chunk = apexList.slice(i, i + 50);
+      await db.batch(
+        chunk.map((a) =>
+          db
+            .prepare(
+              `INSERT OR IGNORE INTO domains (domain, tld) VALUES (?1, ?2)`,
+            )
+            .bind(a, tldOf(a)),
+        ),
       );
     }
   }
